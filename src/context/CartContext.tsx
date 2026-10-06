@@ -86,6 +86,8 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Sync from server API
   const pullFromServer = useCallback(async (userId: string) => {
     if (!userId) return;
+    // Skip if a sync is currently in progress to avoid race conditions
+    if (isSyncing) return;
     // Skip if user recently performed an action locally (debounce race conditions)
     if (Date.now() - lastMutationTimeRef.current < 2500) return;
 
@@ -103,7 +105,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     } catch (err) {
       console.warn('Failed pulling cart from server:', err);
     }
-  }, [saveToLocalStorage]);
+  }, [saveToLocalStorage, isSyncing]);
 
   // Handle auth changes and initialization
   useEffect(() => {
