@@ -13,6 +13,7 @@ interface CartContextType {
   clearCart: () => void;
   totalItems: number;
   totalKobo: number;
+  totalAmount: number;
   totalFormatted: string;
   isSyncing: boolean;
   lastSyncedAt: Date | null;
@@ -30,13 +31,15 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
 
   const activeUserId = user?.id || null;
+  const prevUserIdRef = useRef<string | null>(null);
+  const lastMutationTimeRef = useRef<number>(0);
   const itemsRef = useRef<CartItem[]>(items);
   itemsRef.current = items;
 
   // Local storage helper
-  const saveToLocalStorage = useCallback(async (cartItems: CartItem[]) => {
+  const saveToLocalStorage = useCallback(async (cartItems: CartItem[], forUserId: string | null = activeUserId) => {
     try {
-      const key = activeUserId ? `aroma_cart_${activeUserId}` : GUEST_STORAGE_KEY;
+      const key = forUserId ? `aroma_cart_${forUserId}` : GUEST_STORAGE_KEY;
       const dataStr = JSON.stringify(cartItems);
       if (Platform.OS === 'web' && typeof window !== 'undefined') {
         localStorage.setItem(key, dataStr);
@@ -48,9 +51,9 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   }, [activeUserId]);
 
-  const loadFromLocalStorage = useCallback(async (): Promise<CartItem[]> => {
+  const loadFromLocalStorage = useCallback(async (forUserId: string | null = activeUserId): Promise<CartItem[]> => {
     try {
-      const key = activeUserId ? `aroma_cart_${activeUserId}` : GUEST_STORAGE_KEY;
+      const key = forUserId ? `aroma_cart_${forUserId}` : GUEST_STORAGE_KEY;
       let dataStr: string | null = null;
       if (Platform.OS === 'web' && typeof window !== 'undefined') {
         dataStr = localStorage.getItem(key);
@@ -70,6 +73,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Sync to server API
   const pushToServer = useCallback(async (userId: string, cartItems: CartItem[]) => {
     if (!userId) return;
+    lastMutationTimeRef.current = Date.now();
     setIsSyncing(true);
     try {
       await saveUserCart(userId, cartItems);
@@ -82,6 +86,9 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Sync from server API
   const pullFromServer = useCallback(async (userId: string) => {
     if (!userId) return;
+    // Skip if user recently performed an action locally (debounce race conditions)
+    if (Date.now() - lastMutationTimeRef.current < 2500) return;
+
     try {
       const remoteItems = await getUserCart(userId);
       const current = itemsRef.current;
@@ -90,7 +97,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       if (currentKey !== remoteKey) {
         setItems(remoteItems);
-        saveToLocalStorage(remoteItems);
+        saveToLocalStorage(remoteItems, userId);
         setLastSyncedAt(new Date());
       }
     } catch (err) {
@@ -98,52 +105,88 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   }, [saveToLocalStorage]);
 
-  // Initial load when user or mount changes
+  // Handle auth changes and initialization
   useEffect(() => {
     let mounted = true;
+    const prevUserId = prevUserIdRef.current;
+    prevUserIdRef.current = activeUserId;
 
-    async function init() {
-      const local = await loadFromLocalStorage();
-      if (!mounted) return;
-
-      if (activeUserId) {
-        setIsSyncing(true);
-        try {
-          const remote = await getUserCart(activeUserId);
-          if (mounted) {
-            let finalItems = local;
-            if (remote.length > 0 && local.length === 0) {
-              finalItems = remote;
-            } else if (remote.length > 0 && local.length > 0) {
-              // Merge items
-              const map = new Map<string, CartItem>();
-              local.forEach(i => map.set(i.id, { ...i }));
-              remote.forEach(r => {
-                if (map.has(r.id)) {
-                  map.get(r.id)!.qty = Math.max(map.get(r.id)!.qty, r.qty);
-                } else {
-                  map.set(r.id, r);
-                }
-              });
-              finalItems = Array.from(map.values());
-            } else if (local.length > 0 && remote.length === 0) {
-              // Push local to remote
-              pushToServer(activeUserId, local);
-              finalItems = local;
-            }
-            setItems(finalItems);
-            saveToLocalStorage(finalItems);
-            setLastSyncedAt(new Date());
+    async function syncCartOnAuthChange() {
+      try {
+        if (!activeUserId) {
+          // GUEST MODE:
+          if (prevUserId !== null) {
+            // User just logged out — clear current in-memory cart without touching server
+            if (mounted) setItems([]);
+          } else {
+            // App launched as guest — load any existing guest cart
+            const guestCart = await loadFromLocalStorage(null);
+            if (mounted) setItems(guestCart);
           }
-        } finally {
-          if (mounted) setIsSyncing(false);
+          return;
         }
-      } else {
-        setItems(local);
+
+        // AUTHENTICATED MODE:
+        setIsSyncing(true);
+
+        // 1. Check for temporary guest items to merge
+        let guestItems: CartItem[] = [];
+        const guestCart = await loadFromLocalStorage(null);
+        if (guestCart.length > 0) {
+          guestItems = guestCart;
+        }
+
+        // 2. Load locally cached cart for instant display (no blank screen)
+        const cachedUserCart = await loadFromLocalStorage(activeUserId);
+        if (cachedUserCart.length > 0 && mounted) {
+          setItems(cachedUserCart);
+        }
+
+        // 3. Fetch canonical cart from backend (Single Source of Truth)
+        const remoteItems = await getUserCart(activeUserId);
+        if (!mounted) return;
+
+        let finalItems: CartItem[] = remoteItems.length > 0 ? remoteItems : cachedUserCart;
+
+        if (guestItems.length > 0) {
+          // Merge guest cart into customer's account cart
+          const map = new Map<string, CartItem>();
+          finalItems.forEach(i => map.set(i.id, { ...i }));
+
+          guestItems.forEach(g => {
+            if (map.has(g.id)) {
+              map.get(g.id)!.qty += g.qty;
+            } else {
+              map.set(g.id, { ...g });
+            }
+          });
+
+          finalItems = Array.from(map.values());
+
+          // Clear guest storage after successful merge
+          if (Platform.OS === 'web' && typeof window !== 'undefined') {
+            localStorage.removeItem(GUEST_STORAGE_KEY);
+          } else {
+            await AsyncStorage.removeItem(GUEST_STORAGE_KEY).catch(() => {});
+          }
+
+          // Push merged cart to backend
+          await pushToServer(activeUserId, finalItems);
+        }
+
+        if (mounted) {
+          setItems(finalItems);
+          saveToLocalStorage(finalItems, activeUserId);
+          setLastSyncedAt(new Date());
+        }
+      } catch (err) {
+        console.warn('Error synchronizing mobile cart on auth change:', err);
+      } finally {
+        if (mounted) setIsSyncing(false);
       }
     }
 
-    init();
+    syncCartOnAuthChange();
 
     return () => {
       mounted = false;
@@ -164,6 +207,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Add Item
   const addItem = useCallback(
     (item: Omit<CartItem, 'qty'>, qty: number = 1) => {
+      lastMutationTimeRef.current = Date.now();
       const count = Math.max(1, qty);
       const target: CartItem = {
         id: item.id,
@@ -176,7 +220,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       setItems(prev => {
         const list = Array.isArray(prev) ? prev : [];
-        const index = list.findIndex(i => i.id === item.id);
+        const index = list.findIndex(i => i.id === item.id || (item.slug && i.slug === item.slug));
         let updated: CartItem[];
         if (index > -1) {
           updated = list.map((it, idx) => (idx === index ? { ...it, qty: it.qty + count } : it));
@@ -184,7 +228,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           updated = [...list, target];
         }
 
-        saveToLocalStorage(updated);
+        saveToLocalStorage(updated, activeUserId);
         if (activeUserId) {
           pushToServer(activeUserId, updated);
         }
@@ -197,10 +241,11 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Remove Item
   const removeItem = useCallback(
     (id: string) => {
+      lastMutationTimeRef.current = Date.now();
       setItems(prev => {
         const list = Array.isArray(prev) ? prev : [];
         const updated = list.filter(i => i.id !== id);
-        saveToLocalStorage(updated);
+        saveToLocalStorage(updated, activeUserId);
         if (activeUserId) {
           pushToServer(activeUserId, updated);
         }
@@ -213,13 +258,14 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Update Quantity
   const updateQty = useCallback(
     (id: string, delta: number) => {
+      lastMutationTimeRef.current = Date.now();
       setItems(prev => {
         const list = Array.isArray(prev) ? prev : [];
         const updated = list
           .map(i => (i.id === id ? { ...i, qty: i.qty + delta } : i))
           .filter(i => i.qty > 0);
 
-        saveToLocalStorage(updated);
+        saveToLocalStorage(updated, activeUserId);
         if (activeUserId) {
           pushToServer(activeUserId, updated);
         }
@@ -231,6 +277,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   // Clear Cart
   const clearCart = useCallback(async () => {
+    lastMutationTimeRef.current = Date.now();
     setItems([]);
     if (activeUserId) {
       deleteUserCartApi(activeUserId).catch(() => {});
@@ -269,6 +316,7 @@ export const CartProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         clearCart,
         totalItems,
         totalKobo,
+        totalAmount: totalKobo,
         totalFormatted,
         isSyncing,
         lastSyncedAt,
@@ -285,3 +333,4 @@ export const useCart = () => {
   if (!ctx) throw new Error('useCart must be used within a CartProvider');
   return ctx;
 };
+
