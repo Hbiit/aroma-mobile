@@ -1,5 +1,6 @@
 import { CartItem, Product } from '../types';
 import { supabase } from './supabase';
+import { FALLBACK_PRODUCTS } from '../constants/products';
 
 export const API_BASE_URL = 'https://aroma-deluz.vercel.app';
 
@@ -21,16 +22,17 @@ export async function getProducts(): Promise<Product[]> {
     const res = await fetchApi('/api/products');
     if (!res.ok) throw new Error('Failed to fetch products');
     const data = await res.json();
-    return Array.isArray(data) ? data : [];
+    if (Array.isArray(data) && data.length > 0) return data;
   } catch (error) {
-    console.warn('Error fetching products from API, falling back to Supabase:', error);
-    try {
-      const { data } = await supabase.from('products').select('*');
-      return Array.isArray(data) ? data : [];
-    } catch {
-      return [];
-    }
+    console.warn('Notice fetching products from API, falling back to local catalog:', error);
   }
+
+  try {
+    const { data } = await supabase.from('products').select('*');
+    if (Array.isArray(data) && data.length > 0) return data;
+  } catch {}
+
+  return FALLBACK_PRODUCTS;
 }
 
 export async function getUserCart(userId: string): Promise<CartItem[]> {
