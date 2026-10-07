@@ -161,12 +161,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          reference: orderRef,
-          paymentMethod,
+          ...payload,
           customerEmail: email.trim(),
           transactionId: 'direct_' + Date.now().toString(36),
         }),
-      }).catch(() => {});
+      }).catch((e) => console.warn('Order confirm notification notice:', e));
 
       await clearCart();
       setOrderConfirmed(orderRef);
@@ -220,17 +219,16 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         body: JSON.stringify(payload),
       });
 
-      // 2. Confirm order & dispatch confirmation email via backend Nodemailer
+      // 2. Confirm order & dispatch confirmation email via backend
       await fetch('https://aroma-deluz.vercel.app/api/orders/confirm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          reference: activeOrderRef,
-          paymentMethod: 'paystack',
+          ...payload,
           customerEmail: email.trim(),
           transactionId: 'pstk_test_' + Date.now().toString(36),
         }),
-      }).catch(() => {});
+      }).catch((e) => console.warn('Paystack confirm notification notice:', e));
 
       // 3. Clear cart across web and mobile
       await clearCart();
@@ -597,15 +595,16 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               </Text>
             </ScrollView>
           )}
+        </View>
 
-          {/* Dedicated Interactive Paystack Demo Payment Modal */}
-          <Modal
-            visible={paystackModalVisible}
-            transparent={true}
-            animationType="slide"
-            onRequestClose={handlePaystackCancel}
-          >
-            <View style={styles.paystackOverlay}>
+        {/* Dedicated Interactive Paystack Demo Payment Sheet (Full Modal Overlay) */}
+        {paystackModalVisible && (
+          <View style={styles.paystackOverlay}>
+            <ScrollView
+              contentContainerStyle={styles.paystackScroll}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
               <View style={styles.paystackCard}>
                 {/* Paystack Header */}
                 <View style={styles.paystackHeader}>
@@ -805,9 +804,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </TouchableOpacity>
                 </View>
               </View>
-            </View>
-          </Modal>
-        </View>
+            </ScrollView>
+          </View>
+        )}
       </KeyboardAvoidingView>
     </Modal>
   );
@@ -1195,8 +1194,13 @@ const styles = StyleSheet.create({
 
   /* Paystack In-App Modal Styles */
   paystackOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(1, 27, 51, 0.85)',
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(1, 27, 51, 0.95)',
+    zIndex: 1000,
+    elevation: 25,
+  },
+  paystackScroll: {
+    flexGrow: 1,
     justifyContent: 'center',
     alignItems: 'center',
     padding: 16,

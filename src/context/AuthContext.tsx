@@ -15,6 +15,8 @@ interface AuthContextType {
   signIn: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
   signUp: (email: string, password: string, name?: string) => Promise<{ success: boolean; error?: string }>;
   signInWithGoogle: () => Promise<{ success: boolean; error?: string }>;
+  getGoogleAuthUrl: () => Promise<{ url?: string; error?: string }>;
+  completeGoogleAuth: (params: { access_token?: string; refresh_token?: string; code?: string }) => Promise<{ success: boolean; error?: string }>;
   signOut: () => Promise<void>;
 }
 
@@ -88,7 +90,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     initAuth();
 
     // Listen to Supabase state changes
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
       if (session?.user) {
         const activeUser: User = {
           id: session.user.id,
@@ -97,8 +99,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         };
         setUser(activeUser);
         AsyncStorage.setItem(STORAGE_USER_KEY, JSON.stringify(activeUser));
-      } else if (!user) {
+      } else if (event === 'SIGNED_OUT') {
         setUser(null);
+        AsyncStorage.removeItem(STORAGE_USER_KEY);
       }
       setLoading(false);
     });
@@ -267,13 +270,15 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
 
       // On Native Mobile (Android APK & iOS)
-      const redirectUrl = 'aromadeluz://auth/callback';
+      // Route through production website OAuth callback to eliminate localhost:3000 redirects
+      const deepLink = 'aromadeluz://auth/callback';
+      const webRedirectUrl = `https://aroma-deluz.vercel.app/auth/callback?next=${encodeURIComponent(deepLink)}`;
 
-      // Request OAuth URL from Supabase with mobile deep link redirect
+      // Request OAuth URL from Supabase with authorized web callback
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: redirectUrl,
+          redirectTo: webRedirectUrl,
           skipBrowserRedirect: true,
         },
       });
@@ -282,8 +287,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         return { success: false, error: error?.message || 'Could not initiate Google authentication' };
       }
 
-      // Open official Google authentication session inside secure in-app tab
-      const authResult = await WebBrowser.openAuthSessionAsync(data.url, redirectUrl);
+      // Open official Google authentication session inside secure in-app tab listening for deepLink
+      const authResult = await WebBrowser.openAuthSessionAsync(data.url, deepLink);
 
       if (authResult.type === 'cancel' || authResult.type === 'dismiss') {
         return { success: false, error: 'Sign in was cancelled' };
@@ -360,7 +365,108 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
-  // 4. Native Sign Out
+  // 4. Helper to get OAuth URL for in-app Google Auth Modal
+  const getGoogleAuthUrl = async (): Promise<{ url?: string; error?: string }> => {
+    try {
+      const deepLink = 'aromadeluz://auth/callback';
+      const redirectUrl = `https://aroma-deluz.vercel.app/auth/callback?next=${encodeURIComponent(deepLink)}`;
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: redirectUrl,
+          skipBrowserRedirect: true,
+        },
+      });
+
+      if (error || !data?.url) {
+        return { error: error?.message || 'Could not initiate Google authentication' };
+      }
+      return { url: data.url };
+    } catch (e: any) {
+      return { error: e?.message || 'Failed to prepare Google authentication' };
+    }
+  };
+
+  // 5. Complete Google Auth from intercepted tokens (handles localhost:3000, aromadeluz://, or code)
+  const completeGoogleAuth = async (params: {
+    access_token?: string;
+    refresh_token?: string;
+    code?: string;
+  }): Promise<{ success: boolean; error?: string }> => {
+    try {
+      setLoading(true);
+
+      // 1. If access_token & refresh_token were returned in URL hash fragment
+      if (params.access_token && params.refresh_token) {
+        const { data: sessionData, error: sessionErr } = await supabase.auth.setSession({
+          access_token: params.access_token,
+          refresh_token: params.refresh_token,
+        });
+
+        if (!sessionErr && sessionData.user) {
+          const activeUser: User = {
+            id: sessionData.user.id,
+            email: sessionData.user.email || '',
+            name:
+              sessionData.user.user_metadata?.full_name ||
+              sessionData.user.user_metadata?.name ||
+              sessionData.user.email?.split('@')[0] ||
+              'Valued Client',
+          };
+          setUser(activeUser);
+          await AsyncStorage.setItem(STORAGE_USER_KEY, JSON.stringify(activeUser));
+          return { success: true };
+        }
+      }
+
+      // 2. If authorization code was returned
+      if (params.code) {
+        const { data: codeData, error: codeErr } = await supabase.auth.exchangeCodeForSession(
+          params.code
+        );
+        if (!codeErr && codeData.user) {
+          const activeUser: User = {
+            id: codeData.user.id,
+            email: codeData.user.email || '',
+            name:
+              codeData.user.user_metadata?.full_name ||
+              codeData.user.user_metadata?.name ||
+              codeData.user.email?.split('@')[0] ||
+              'Valued Client',
+          };
+          setUser(activeUser);
+          await AsyncStorage.setItem(STORAGE_USER_KEY, JSON.stringify(activeUser));
+          return { success: true };
+        }
+      }
+
+      // 3. Fallback: inspect active session
+      const { data: verifySession } = await supabase.auth.getSession();
+      if (verifySession.session?.user) {
+        const u = verifySession.session.user;
+        const activeUser: User = {
+          id: u.id,
+          email: u.email || '',
+          name:
+            u.user_metadata?.full_name ||
+            u.user_metadata?.name ||
+            u.email?.split('@')[0] ||
+            'Valued Client',
+        };
+        setUser(activeUser);
+        await AsyncStorage.setItem(STORAGE_USER_KEY, JSON.stringify(activeUser));
+        return { success: true };
+      }
+
+      return { success: false, error: 'Could not restore Google user session' };
+    } catch (e: any) {
+      return { success: false, error: e?.message || 'Authentication processing error' };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 6. Native Sign Out
   const signOut = async () => {
     await supabase.auth.signOut().catch(() => {});
     await AsyncStorage.removeItem(STORAGE_USER_KEY);
@@ -368,7 +474,18 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, signIn, signUp, signInWithGoogle, signOut }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        signIn,
+        signUp,
+        signInWithGoogle,
+        getGoogleAuthUrl,
+        completeGoogleAuth,
+        signOut,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
