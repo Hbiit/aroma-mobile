@@ -185,6 +185,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       const json = await res.json().catch(() => ({}));
       if (res.ok && json.success && json.user) {
+        if (json.session?.access_token && json.session?.refresh_token) {
+          await supabase.auth.setSession({
+            access_token: json.session.access_token,
+            refresh_token: json.session.refresh_token,
+          }).catch(() => {});
+        }
         setUser(json.user);
         await AsyncStorage.setItem(STORAGE_USER_KEY, JSON.stringify(json.user));
         return { success: true };
@@ -217,7 +223,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       const json = await res.json().catch(() => ({}));
       if (res.ok && json.success && json.user) {
-        await supabase.auth.signInWithPassword({ email: cleanEmail, password }).catch(() => {});
+        if (json.session?.access_token && json.session?.refresh_token) {
+          await supabase.auth.setSession({
+            access_token: json.session.access_token,
+            refresh_token: json.session.refresh_token,
+          }).catch(() => {});
+        } else {
+          await supabase.auth.signInWithPassword({ email: cleanEmail, password }).catch(() => {});
+        }
         setUser(json.user);
         await AsyncStorage.setItem(STORAGE_USER_KEY, JSON.stringify(json.user));
         return { success: true };
